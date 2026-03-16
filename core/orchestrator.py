@@ -7,6 +7,8 @@ Manages the full lifecycle of a bug-bounty hunt:
   - Queues and dispatches recon, scanning, and reporting tasks
   - Tracks discovered endpoints, parameters, and auth roles in memory
   - Provides clean start/stop semantics and graceful error recovery
+  - Instantiates the AutonomousAgent for fully self-driving operation
+    when no manual endpoint list is provided
 """
 
 from __future__ import annotations
@@ -162,6 +164,122 @@ class Orchestrator:
                 for t in self._tasks
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Autonomous mode
+    # ------------------------------------------------------------------
+
+    def run_autonomous(
+        self,
+        seed_urls: Optional[List[str]] = None,
+        use_crawler: bool = False,
+        token_user_a: Optional[str] = None,
+        token_user_b: Optional[str] = None,
+        token_admin: Optional[str] = None,
+    ) -> "Coroutine[Any, Any, Dict[str, Any]]":
+        """
+        Convenience entry-point that wires up the ``AutonomousAgent`` and
+        optional ``AutoCrawler``, then runs the full self-driving OODA loop.
+
+        Parameters
+        ----------
+        seed_urls:
+            Initial URLs to feed the agent.  Defaults to ``[target]``.
+        use_crawler:
+            When True, run the headless ``AutoCrawler`` first and add its
+            discovered endpoints to the seed list before starting the agent.
+            Requires ``playwright`` to be installed.
+        token_user_a / token_user_b / token_admin:
+            Optional auth tokens for IDOR state-machine testing.
+
+        Returns
+        -------
+        A coroutine that, when awaited, returns the full findings report dict.
+
+        Usage::
+
+            orch = Orchestrator(target="https://example.com")
+            report = await orch.run_autonomous(
+                token_user_a="Bearer eyJ...",
+                token_admin="Bearer eyJ...",
+                use_crawler=True,
+            )
+        """
+        return self._autonomous_pipeline(
+            seed_urls=seed_urls,
+            use_crawler=use_crawler,
+            token_user_a=token_user_a,
+            token_user_b=token_user_b,
+            token_admin=token_admin,
+        )
+
+    async def _autonomous_pipeline(
+        self,
+        seed_urls: Optional[List[str]],
+        use_crawler: bool,
+        token_user_a: Optional[str],
+        token_user_b: Optional[str],
+        token_admin: Optional[str],
+    ) -> Dict[str, Any]:
+        """Internal implementation of the autonomous pipeline."""
+        # Import here to avoid circular imports at module load time
+        from core.autonomous_agent import AutonomousAgent
+
+        urls: List[str] = list(seed_urls) if seed_urls else [self.state.target]
+
+        # ── Optional: auto-crawl with headless browser ─────────────────
+        if use_crawler:
+            try:
+                from recon.auto_crawler import AutoCrawler
+                logger.info("[Orchestrator] Starting AutoCrawler on %s", self.state.target)
+                crawler = AutoCrawler()
+                crawl_result = await crawler.crawl(self.state.target)
+                crawled_endpoints = crawl_result.endpoint_list()
+                logger.info(
+                    "[Orchestrator] Crawler discovered %d endpoints",
+                    len(crawled_endpoints),
+                )
+                urls = list({*urls, *crawled_endpoints})
+                # Track in state and record any crawler secrets as findings
+                for ep in crawled_endpoints:
+                    self.state.add_endpoint(ep)
+                for secret in crawl_result.secrets_found:
+                    self.state.record_finding(secret)
+            except ImportError:
+                logger.warning(
+                    "[Orchestrator] Playwright not installed — skipping auto-crawl. "
+                    "Run: pip install playwright && playwright install chromium"
+                )
+
+        # ── Instantiate and configure the autonomous agent ─────────────
+        agent = AutonomousAgent(concurrency=self._concurrency)
+        agent.set_auth_tokens(
+            user_a=token_user_a,
+            user_b=token_user_b,
+            admin=token_admin,
+        )
+
+        # Register tokens in shared state for cross-module visibility
+        if token_user_a:
+            self.state.add_role("user_a", token_user_a)
+        if token_user_b:
+            self.state.add_role("user_b", token_user_b)
+        if token_admin:
+            self.state.add_role("admin", token_admin)
+
+        # ── Run the OODA loop ───────────────────────────────────────────
+        logger.info(
+            "[Orchestrator] Launching AutonomousAgent with %d seed URLs", len(urls)
+        )
+        agent_findings = await agent.run(seed_urls=urls)
+
+        # ── Merge agent findings into shared hunt state ─────────────────
+        for finding in agent_findings:
+            self.state.record_finding(finding)
+        for ep in agent.get_visited_endpoints():
+            self.state.add_endpoint(ep)
+
+        return self.get_report()
 
     # ------------------------------------------------------------------
     # Internal machinery

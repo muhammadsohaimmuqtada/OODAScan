@@ -1,112 +1,166 @@
 # Advanced BB Toolkit
 
-A professional, market-ready bug bounty framework built with Python 3.10+.
-It focuses on custom internal logic, asynchronous execution, and advanced
-vulnerability classes including OWASP Top 10 and business-logic flaws — with
-no reliance on third-party vulnerability APIs.
+A professional, market-ready, **fully autonomous** bug bounty framework built
+with Python 3.10+.  It implements a self-driving OODA loop (Observe → Orient →
+Decide → Act) so the only input required is the target domain — no manual
+endpoint feeding, no manual token state switching, no external vulnerability
+APIs.
 
 ## Architecture
 
 ```
 advanced-bb-toolkit/
 ├── core/
-│   └── orchestrator.py       # Async task runner — manages hunt state & task queue
+│   ├── orchestrator.py         # Async task runner + autonomous pipeline entry-point
+│   └── autonomous_agent.py     # OODA loop AI engine — the self-driving "Brain"
 ├── scanners/
-│   ├── business_logic.py     # HPP, Mass Assignment, Race Conditions, IDOR State Machine
-│   └── auth.py               # JWT offline analysis, OAuth state & PKCE checks
+│   ├── business_logic.py       # HPP, Mass Assignment, Race Conditions, IDOR State Machine
+│   ├── auth.py                 # JWT offline analysis, OAuth state & PKCE checks
+│   └── auto_payload_generator.py  # Schema-aware dynamic payload generation
 ├── recon/
-│   └── cloud_mapper.py       # Async cloud asset recon (S3, GCP, Azure)
+│   ├── cloud_mapper.py         # Async cloud asset recon (S3, GCP, Azure)
+│   └── auto_crawler.py         # Headless Playwright DOM crawler & JS analyser
 └── utils/
-    └── evasion.py            # WAF evasion engine — header rotation, UA rotation, path mutations
+    ├── evasion.py              # Base WAF evasion engine
+    └── auto_evasion.py         # Self-healing WAF auto-tuning with retry loops
 ```
 
 ## Modules
 
-### `core/orchestrator.py`
-An `asyncio`-based task runner that manages the complete state of a hunt
-session.  It queues and dispatches recon, scanning, and reporting tasks with
-configurable concurrency, and tracks discovered endpoints, parameters, and
-auth roles in a shared `HuntState` object.
+### `core/autonomous_agent.py` *(NEW)*
+The self-driving engine.  Implements a full OODA loop:
+- **Observe** — probes each URL with evasion-wrapped requests.
+- **Orient** — classifies the endpoint as GraphQL, REST, Auth, Admin, or Unknown
+  using purely heuristic, pattern-based rules (no LLM API required).
+- **Decide** — selects the matching built-in scanner(s) from the action registry.
+- **Act** — fires the scanner, collects findings, and feeds any newly discovered
+  endpoints back into the queue for the next round.
+
+Built-in actions:
+| Endpoint Kind | Actions |
+|---|---|
+| `GRAPHQL` | Introspection probe, batching abuse |
+| `REST_JSON` | IDOR path enumeration, HTTP method enumeration |
+| `AUTH` | Default credential testing, JWT issuance analysis |
+| `ADMIN_PANEL` | Unauthenticated access check, admin path discovery |
+| `UNKNOWN` | Header tech disclosure, stack-trace, hardcoded secret patterns |
+
+### `recon/auto_crawler.py` *(NEW)*
+Headless Playwright-based DOM crawler:
+- Intercepts all XHR/Fetch API calls made by the SPA in real-time.
+- Downloads and statically analyses webpack JS bundles for API routes.
+- Scrapes `data-*` attributes and inline `<script>` blocks.
+- Flags hardcoded AWS keys, API keys, bearer tokens, and private keys found
+  in JavaScript source.
+- Feeds the full endpoint list directly into the `AutonomousAgent`.
+
+### `scanners/auto_payload_generator.py` *(NEW)*
+Schema-aware dynamic payload generator:
+- Infers each field's semantic kind (numeric ID, amount, path, email, …) from
+  its name and current value — no static wordlists.
+- Generates targeted payloads per kind:
+  - **Numeric IDs** → IDOR (`±1`, `0`, `-1`, `2^31`), SQLi, NoSQL, type confusion
+  - **Amounts** → business-logic (`-1`, `0`, overflow, `NaN`, `Infinity`)
+  - **Strings** → SQLi, NoSQL, XSS, SSTI, format string, path traversal
+  - **Paths** → directory traversal, `file://`, URL encoding variants
+  - **Booleans** → truthy/falsy coercion variants
+- Always appends a mass-assignment mutation injecting admin/privilege fields.
+
+### `utils/auto_evasion.py` *(NEW)*
+Self-healing WAF bypass wrapper:
+- Detects 403, 429, 503, and known WAF challenge page bodies automatically.
+- On each block, rotates through a strategy sequence:
+  `rotate_ua` → `rotate_ip` → `rotate_ua_and_ip` → `mutate_path` →
+  `add_delay` → `randomise_casing` → `full_rotation`
+- Applies exponential back-off with ±50 % jitter between retries.
+- Exposes a single `resilient_request()` coroutine used by every scanner.
+
+### `core/orchestrator.py` *(updated)*
+Now exposes a `run_autonomous()` method that:
+1. Optionally launches `AutoCrawler` to seed endpoints from the live DOM.
+2. Instantiates `AutonomousAgent` with any provided auth tokens.
+3. Runs the full OODA loop and merges findings back into `HuntState`.
 
 ### `scanners/business_logic.py`
 Self-contained fuzzer for advanced business-logic vulnerabilities:
-- **HTTP Parameter Pollution (HPP)** — duplicates common parameters and
-  analyses divergent server behaviour.
-- **Mass Assignment** — injects privileged fields (`role`, `is_admin`, etc.)
-  into request bodies and checks for acceptance indicators.
-- **Race Condition Detection** — fires highly concurrent burst requests and
-  flags multiple simultaneous successes.
-- **IDOR State Machine** — replays every endpoint across all registered auth
-  contexts (Unauthenticated → User A → User B → Admin) and flags Broken
-  Access Control when a lower-privilege context receives a substantially
-  similar response to the privileged baseline.
+- HTTP Parameter Pollution (HPP)
+- Mass Assignment
+- Race Condition Detection
+- IDOR State Machine
 
 ### `scanners/auth.py`
 Offline authentication vulnerability scanner:
-- **JWT Analysis** — checks for the `none` algorithm, signature stripping,
-  weak HMAC secrets (internal wordlist, no API), and sensitive data in
-  payloads.  Includes a token forger for `none`-alg bypass.
-- **OAuth Checks** — validates that the server rejects missing `state`
-  parameters (CSRF), enforces PKCE, and validates `redirect_uri` against a
-  whitelist.
+- JWT Analysis (none alg, signature stripping, weak HMAC secrets, payload leaks)
+- OAuth Checks (missing state, PKCE enforcement, open redirect)
 
 ### `recon/cloud_mapper.py`
-Async cloud asset recon scanner:
-- Generates dozens of environment/role permutations from the base target name
-  (`target-dev`, `target-backup`, `target-staging`, …).
-- Probes AWS S3, GCP Cloud Storage, and Azure Blob Storage via direct HTTP
-  and classifies responses as `OPEN`, `EXISTS_PROTECTED`, or `NOT_FOUND`.
+Async cloud asset recon scanner (AWS S3, GCP Cloud Storage, Azure Blob).
 
 ### `utils/evasion.py`
-WAF evasion engine used by every active scanner:
-- Rotates User-Agents from a built-in pool.
-- Injects and rotates IP-spoofing headers (`X-Forwarded-For`,
-  `X-Originating-IP`, `Client-IP`, etc.) with common bypass values.
-- Provides path-normalisation mutation helpers (`/./`, `/../`, `/%2f`, …).
-- Optional random header-casing to confuse signature-based rules.
+Base WAF evasion engine — header rotation, UA rotation, path mutations.
 
 ## Installation
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium   # Required for AutoCrawler (headless browser)
 ```
 
 **Python 3.10+ required.**
 
-## Quick Start
+## Quick Start — Autonomous Mode
+
+```python
+import asyncio
+from core.orchestrator import Orchestrator
+
+async def main() -> None:
+    orch = Orchestrator(target="https://example.com", concurrency=20)
+
+    report = await orch.run_autonomous(
+        use_crawler=True,          # DOM crawl first, then agent takes over
+        token_user_a="Bearer eyJ...",
+        token_user_b="Bearer eyJ...",
+        token_admin="Bearer eyJ...",
+    )
+
+    import json
+    print(json.dumps(report, indent=2, default=str))
+
+asyncio.run(main())
+```
+
+## Advanced Usage — Manual Control
 
 ```python
 import asyncio
 from core.orchestrator import Orchestrator, TaskPriority
+from core.autonomous_agent import AutonomousAgent, EndpointKind
 from recon.cloud_mapper import CloudMapper
-from scanners.business_logic import BusinessLogicScanner, AuthContext
+from scanners.auto_payload_generator import AutoPayloadGenerator
 from scanners.auth import JWTAnalyser
 
-TARGET = "example.com"
+TARGET = "https://example.com"
 
 async def main() -> None:
+    # ── Manual orchestrator ───────────────────────────────────────────
     orch = Orchestrator(target=TARGET, concurrency=20)
-
-    # Register auth contexts for the IDOR state machine
     orch.state.add_role("unauthenticated", None)
     orch.state.add_role("user_a", "Bearer <token_a>")
     orch.state.add_role("admin",  "Bearer <admin_token>")
 
-    # Cloud recon task
     mapper = CloudMapper()
-    orch.enqueue(
-        TaskPriority.HIGH, "cloud_recon",
-        lambda: mapper.scan(TARGET),
-    )
-
+    orch.enqueue(TaskPriority.HIGH, "cloud_recon", lambda: mapper.scan(TARGET))
     await orch.run()
-    report = orch.get_report()
-    print(report)
 
-    # Offline JWT analysis
+    # ── Dynamic payload generation ────────────────────────────────────
+    gen = AutoPayloadGenerator()
+    for mutation in gen.generate({"user_id": 123, "amount": 50.0}):
+        print(mutation["_fuzz_meta"])
+
+    # ── Offline JWT analysis ─────────────────────────────────────────
     analyser = JWTAnalyser()
-    findings = analyser.analyse("<your_jwt_here>")
-    for f in findings:
+    for f in analyser.analyse("<your_jwt_here>"):
         print(f.issue, "-", f.details)
 
 asyncio.run(main())
@@ -114,10 +168,11 @@ asyncio.run(main())
 
 ## Requirements
 
-| Library   | Purpose                      |
-|-----------|------------------------------|
-| `aiohttp` | Async HTTP requests          |
-| `PyJWT`   | JWT decoding (reference use) |
+| Library      | Purpose                                    |
+|--------------|--------------------------------------------|
+| `aiohttp`    | Async HTTP requests                        |
+| `PyJWT`      | JWT decoding (reference use)               |
+| `playwright` | Headless browser for AutoCrawler           |
 
 ## Legal Notice
 
