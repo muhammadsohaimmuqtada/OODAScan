@@ -10,19 +10,20 @@ APIs.
 
 ```
 advanced-bb-toolkit/
+├── cli.py                          # ← CLI entry point  (python cli.py scan …)
 ├── core/
-│   ├── orchestrator.py         # Async task runner + autonomous pipeline entry-point
-│   └── autonomous_agent.py     # OODA loop AI engine — the self-driving "Brain"
+│   ├── orchestrator.py             # Async task runner + autonomous pipeline entry-point
+│   └── autonomous_agent.py         # OODA loop AI engine — the self-driving "Brain"
 ├── scanners/
-│   ├── business_logic.py       # HPP, Mass Assignment, Race Conditions, IDOR State Machine
-│   ├── auth.py                 # JWT offline analysis, OAuth state & PKCE checks
-│   └── auto_payload_generator.py  # Schema-aware dynamic payload generation
+│   ├── business_logic.py           # HPP, Mass Assignment, Race Conditions, IDOR State Machine
+│   ├── auth.py                     # JWT offline analysis, OAuth state & PKCE checks
+│   └── auto_payload_generator.py   # Schema-aware dynamic payload generation
 ├── recon/
-│   ├── cloud_mapper.py         # Async cloud asset recon (S3, GCP, Azure)
-│   └── auto_crawler.py         # Headless Playwright DOM crawler & JS analyser
+│   ├── cloud_mapper.py             # Async cloud asset recon (S3, GCP, Azure)
+│   └── auto_crawler.py             # Headless Playwright DOM crawler & JS analyser
 └── utils/
-    ├── evasion.py              # Base WAF evasion engine
-    └── auto_evasion.py         # Self-healing WAF auto-tuning with retry loops
+    ├── evasion.py                  # Base WAF evasion engine
+    └── auto_evasion.py             # Self-healing WAF auto-tuning with retry loops
 ```
 
 ## Modules
@@ -108,7 +109,45 @@ playwright install chromium   # Required for AutoCrawler (headless browser)
 
 **Python 3.10+ required.**
 
-## Quick Start — Autonomous Mode
+## Quick Start — CLI (Recommended)
+
+The easiest way to run the toolkit is via the built-in CLI powered by
+[Typer](https://typer.tiangolo.com/) and [Rich](https://github.com/Textualize/rich).
+
+```bash
+# Minimal autonomous scan
+python cli.py scan --target https://example.com
+
+# Full scan with crawler, auth tokens, and JSON report
+python cli.py scan \
+    --target https://example.com \
+    --use-crawler \
+    --concurrency 30 \
+    --timeout 15 \
+    --token-user-a "Bearer eyJ..." \
+    --token-user-b "Bearer eyJ..." \
+    --token-admin "Bearer eyJ..." \
+    --output report.json
+```
+
+The CLI will display a live spinner during the scan and then print a colour-coded
+findings table to the terminal.  If `--output` is given, the full JSON report is
+written to that file.
+
+### CLI Options
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--target` | `-t` | *required* | Target URL to scan |
+| `--concurrency` | `-c` | `20` | Max simultaneous HTTP requests |
+| `--timeout` | | `10.0` | Per-request timeout (seconds) |
+| `--use-crawler` | | `False` | Enable headless Playwright crawler |
+| `--output` | `-o` | `None` | File path to save JSON report |
+| `--token-user-a` | | `None` | Auth token for User A |
+| `--token-user-b` | | `None` | Auth token for User B |
+| `--token-admin` | | `None` | Auth token for Admin role |
+
+## Quick Start — Python API (Autonomous Mode)
 
 ```python
 import asyncio
@@ -173,6 +212,8 @@ asyncio.run(main())
 | `aiohttp`    | Async HTTP requests                        |
 | `PyJWT`      | JWT decoding (reference use)               |
 | `playwright` | Headless browser for AutoCrawler           |
+| `typer`      | CLI framework                              |
+| `rich`       | Terminal UI (tables, spinners, colours)    |
 
 ## Legal Notice
 
