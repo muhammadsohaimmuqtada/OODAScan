@@ -23,7 +23,7 @@ import re
 import secrets
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 

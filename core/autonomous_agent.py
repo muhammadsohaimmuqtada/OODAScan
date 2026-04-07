@@ -215,9 +215,14 @@ class AutonomousAgent:
         self._actions = _ActionRegistry()
         self._visited: Set[str] = set()
         self._findings: List[Dict[str, Any]] = []
+        self._finding_keys: Set[str] = set()
         self._auth_tokens: Dict[str, Optional[str]] = {
             "unauthenticated": None,
         }
+        # Shared session set for the duration of a run() call
+        self._session: Optional[aiohttp.ClientSession] = None
+        # Semaphore limiting simultaneous OODA cycles
+        self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
 
         # Wire up default internal scanners
         self._register_default_actions()
@@ -263,7 +268,9 @@ class AutonomousAgent:
         processed up to ``max_depth`` rounds.  Returns all aggregated findings.
         """
         self._findings = []
+        self._finding_keys = set()
         self._visited = set()
+        self._sem = asyncio.Semaphore(self._concurrency)
 
         queue: asyncio.Queue[str] = asyncio.Queue()
         for url in seed_urls:
@@ -273,26 +280,38 @@ class AutonomousAgent:
         async with aiohttp.ClientSession(
             connector=connector, timeout=self._timeout
         ) as session:
-            depth = 0
-            while not queue.empty() and depth < self._max_depth:
-                depth += 1
-                batch: List[str] = []
-                while not queue.empty():
-                    batch.append(await queue.get())
+            self._session = session
+            try:
+                depth = 0
+                while not queue.empty() and depth < self._max_depth:
+                    depth += 1
+                    batch: List[str] = []
+                    while not queue.empty():
+                        batch.append(await queue.get())
 
-                logger.info(
-                    "[Agent] OODA round %d — processing %d endpoints",
-                    depth, len(batch),
-                )
-
-                tasks = [
-                    asyncio.create_task(
-                        self._ooda_cycle(session, url, queue)
+                    logger.info(
+                        "[Agent] OODA round %d — processing %d endpoints",
+                        depth, len(batch),
                     )
-                    for url in batch
-                    if url not in self._visited
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
+
+                    async def _wrap(u: str) -> None:
+                        try:
+                            await self._ooda_cycle(session, u, queue)
+                        except Exception as exc:  # pylint: disable=broad-except
+                            logger.error(
+                                "[Agent] OODA cycle error for %s: %s", u, exc, exc_info=False
+                            )
+
+                    await asyncio.gather(
+                        *[
+                            asyncio.create_task(_wrap(url))
+                            for url in batch
+                            if url not in self._visited
+                        ],
+                        return_exceptions=True,
+                    )
+            finally:
+                self._session = None
 
         logger.info(
             "[Agent] Complete. Visited=%d, Findings=%d",
@@ -315,40 +334,47 @@ class AutonomousAgent:
             return
         self._visited.add(url)
 
-        # ── Observe ──────────────────────────────────────────────────────
-        obs = await self._observe(session, url)
-        if obs is None:
+        if self._session is None:
+            logger.warning("[Agent] _ooda_cycle called outside of run() context; skipping %s", url)
             return
 
-        # ── Orient ───────────────────────────────────────────────────────
-        obs.kind = self._classifier.classify(obs)
-        logger.info("[Orient] %s → %s (HTTP %d)", url, obs.kind.name, obs.status)
+        async with self._sem:
+            # ── Observe ──────────────────────────────────────────────────────
+            obs = await self._observe(session, url)
+            if obs is None:
+                return
 
-        # Extract any new endpoints found in the response body
-        discovered = self._extract_endpoints_from_body(obs)
-        for ep in discovered:
-            if ep not in self._visited:
-                await discovery_queue.put(ep)
-                logger.debug("[Orient] Discovered new endpoint: %s", ep)
+            # ── Orient ───────────────────────────────────────────────────────
+            obs.kind = self._classifier.classify(obs)
+            logger.info("[Orient] %s → %s (HTTP %d)", url, obs.kind.name, obs.status)
 
-        # ── Decide & Act ─────────────────────────────────────────────────
-        actions = self._actions.get_actions(obs.kind)
-        if not actions:
-            logger.debug("[Decide] No registered actions for %s", obs.kind.name)
-            return
+            # Extract any new endpoints found in the response body
+            discovered = self._extract_endpoints_from_body(obs)
+            for ep in discovered:
+                if ep not in self._visited:
+                    await discovery_queue.put(ep)
+                    logger.debug("[Orient] Discovered new endpoint: %s", ep)
 
-        action_tasks = [
-            asyncio.create_task(action(obs))
-            for action in actions
-        ]
-        results = await asyncio.gather(*action_tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, list):
-                for finding in result:
-                    finding.setdefault("url", url)
-                    finding.setdefault("endpoint_kind", obs.kind.name)
-                    self._findings.append(finding)
-                    obs.scan_results.append(finding)
+            # ── Decide & Act ─────────────────────────────────────────────────
+            actions = self._actions.get_actions(obs.kind)
+            if not actions:
+                logger.debug("[Decide] No registered actions for %s", obs.kind.name)
+                return
+
+            action_tasks = [
+                asyncio.create_task(action(obs))
+                for action in actions
+            ]
+            results = await asyncio.gather(*action_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("[Act] Scanner error on %s: %s", url, result, exc_info=False)
+                elif isinstance(result, list):
+                    for finding in result:
+                        finding.setdefault("url", url)
+                        finding.setdefault("endpoint_kind", obs.kind.name)
+                        self._record_finding(finding)
+                        obs.scan_results.append(finding)
 
     # ------------------------------------------------------------------
     # Observe
@@ -424,6 +450,30 @@ class AutonomousAgent:
         return unique
 
     # ------------------------------------------------------------------
+    # Finding deduplication
+    # ------------------------------------------------------------------
+
+    def _record_finding(self, finding: Dict[str, Any]) -> None:
+        """Append *finding* only if it hasn't been seen before.
+
+        The deduplication key covers the fields most likely to distinguish
+        separate findings of the same type: ``type``, ``url``, ``probe_url``,
+        ``role``, and ``method``.  This prevents suppressing distinct IDOR
+        findings (different probe IDs) or auth findings (different creds)
+        while still avoiding exact duplicates.
+        """
+        key = "|".join([
+            str(finding.get("type", "")),
+            str(finding.get("url", "")),
+            str(finding.get("probe_url", "")),
+            str(finding.get("role", "")),
+            str(finding.get("method", "")),
+        ])
+        if key not in self._finding_keys:
+            self._finding_keys.add(key)
+            self._findings.append(finding)
+
+    # ------------------------------------------------------------------
     # Default built-in actions
     # ------------------------------------------------------------------
 
@@ -444,48 +494,43 @@ class AutonomousAgent:
           - Field suggestion leakage
         """
         findings: List[Dict[str, Any]] = []
+        session = self._session
 
-        # Build an aiohttp session just for these sub-probes
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(
-            connector=connector, timeout=self._timeout
-        ) as session:
+        # Probe 1: Introspection
+        introspection_query = {
+            "query": "{ __schema { queryType { name } types { name kind } } }"
+        }
+        headers = {
+            **self._evasion.build_headers(),
+            "Content-Type": "application/json",
+        }
+        resp, body = await self._evasion.resilient_request(
+            session, "POST", obs.url, json=introspection_query, headers=headers
+        )
+        if resp and resp.status == 200 and "__schema" in body:
+            findings.append({
+                "type": "GraphQL Introspection Enabled",
+                "severity": "Medium",
+                "details": "GraphQL introspection is publicly accessible. "
+                           "Full schema can be enumerated.",
+                "evidence": body[:500],
+            })
 
-            # Probe 1: Introspection
-            introspection_query = {
-                "query": "{ __schema { queryType { name } types { name kind } } }"
-            }
-            headers = {
-                **self._evasion.build_headers(),
-                "Content-Type": "application/json",
-            }
-            resp, body = await self._evasion.resilient_request(
-                session, "POST", obs.url, json=introspection_query, headers=headers
-            )
-            if resp and resp.status == 200 and "__schema" in body:
-                findings.append({
-                    "type": "GraphQL Introspection Enabled",
-                    "severity": "Medium",
-                    "details": "GraphQL introspection is publicly accessible. "
-                               "Full schema can be enumerated.",
-                    "evidence": body[:500],
-                })
-
-            # Probe 2: Batching
-            batch_query = [
-                {"query": "{ __typename }"},
-                {"query": "{ __typename }"},
-            ]
-            resp, body = await self._evasion.resilient_request(
-                session, "POST", obs.url, json=batch_query, headers=headers
-            )
-            if resp and resp.status == 200 and body.strip().startswith("["):
-                findings.append({
-                    "type": "GraphQL Query Batching Enabled",
-                    "severity": "Low",
-                    "details": "The server supports request batching. "
-                               "This can be abused to amplify brute-force attacks.",
-                })
+        # Probe 2: Batching
+        batch_query = [
+            {"query": "{ __typename }"},
+            {"query": "{ __typename }"},
+        ]
+        resp, body = await self._evasion.resilient_request(
+            session, "POST", obs.url, json=batch_query, headers=headers
+        )
+        if resp and resp.status == 200 and body.strip().startswith("["):
+            findings.append({
+                "type": "GraphQL Query Batching Enabled",
+                "severity": "Low",
+                "details": "The server supports request batching. "
+                           "This can be abused to amplify brute-force attacks.",
+            })
 
         return findings
 
@@ -497,57 +542,50 @@ class AutonomousAgent:
           - JSON parameter type confusion
         """
         findings: List[Dict[str, Any]] = []
+        session = self._session
 
         # IDOR path probe: replace trailing numeric segment with adjacent IDs
         idor_match = re.search(r'/(\d+)(?:/[^/]*)?$', obs.url)
         if idor_match:
             original_id = int(idor_match.group(1))
             probe_ids = [original_id + 1, original_id - 1, 0, 9999999]
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(
-                connector=connector, timeout=self._timeout
-            ) as session:
-                for pid in probe_ids:
-                    probe_url = obs.url[:idor_match.start(1)] + str(pid) + obs.url[idor_match.end(1):]
-                    for role, token in self._auth_tokens.items():
-                        extra = {"Authorization": token} if token else {}
-                        headers = self._evasion.build_headers(extra=extra)
-                        resp, body = await self._evasion.resilient_request(
-                            session, "GET", probe_url, headers=headers
-                        )
-                        if resp and resp.status == 200 and len(body) > 20:
-                            findings.append({
-                                "type": "Potential IDOR",
-                                "severity": "High",
-                                "details": (
-                                    f"Probe ID {pid} returned HTTP 200 as '{role}'. "
-                                    f"Original ID was {original_id}. "
-                                    "Verify whether the resource belongs to a different user."
-                                ),
-                                "probe_url": probe_url,
-                                "role": role,
-                            })
+            for pid in probe_ids:
+                probe_url = obs.url[:idor_match.start(1)] + str(pid) + obs.url[idor_match.end(1):]
+                for role, token in self._auth_tokens.items():
+                    extra = {"Authorization": token} if token else {}
+                    headers = self._evasion.build_headers(extra=extra)
+                    resp, body = await self._evasion.resilient_request(
+                        session, "GET", probe_url, headers=headers
+                    )
+                    if resp and resp.status == 200 and len(body) > 20:
+                        findings.append({
+                            "type": "Potential IDOR",
+                            "severity": "High",
+                            "details": (
+                                f"Probe ID {pid} returned HTTP 200 as '{role}'. "
+                                f"Original ID was {original_id}. "
+                                "Verify whether the resource belongs to a different user."
+                            ),
+                            "probe_url": probe_url,
+                            "role": role,
+                        })
 
         # Method enumeration
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(
-            connector=connector, timeout=self._timeout
-        ) as session:
-            for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
-                headers = self._evasion.build_headers()
-                resp, _ = await self._evasion.resilient_request(
-                    session, method, obs.url, headers=headers
-                )
-                if resp and resp.status not in (405, 404, 501):
-                    findings.append({
-                        "type": "Unexpected HTTP Method Allowed",
-                        "severity": "Low",
-                        "details": (
-                            f"HTTP {method} returned {resp.status} (not 405 Method Not Allowed). "
-                            "Investigate whether the method enables unintended mutations."
-                        ),
-                        "method": method,
-                    })
+        for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
+            headers = self._evasion.build_headers()
+            resp, _ = await self._evasion.resilient_request(
+                session, method, obs.url, headers=headers
+            )
+            if resp and resp.status not in (405, 404, 501):
+                findings.append({
+                    "type": "Unexpected HTTP Method Allowed",
+                    "severity": "Low",
+                    "details": (
+                        f"HTTP {method} returned {resp.status} (not 405 Method Not Allowed). "
+                        "Investigate whether the method enables unintended mutations."
+                    ),
+                    "method": method,
+                })
 
         return findings
 
@@ -561,66 +599,63 @@ class AutonomousAgent:
         from scanners.auth import JWTAnalyser
 
         findings: List[Dict[str, Any]] = []
+        session = self._session
 
         default_creds = [
             ("admin", "admin"), ("admin", "password"), ("admin", "123456"),
             ("root", "root"), ("test", "test"), ("user", "user"),
         ]
 
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(
-            connector=connector, timeout=self._timeout
-        ) as session:
-            success_count = 0
-            for username, password in default_creds:
-                headers = {
-                    **self._evasion.build_headers(),
-                    "Content-Type": "application/json",
-                }
-                resp, body = await self._evasion.resilient_request(
-                    session, "POST", obs.url,
-                    json={"username": username, "password": password},
-                    headers=headers,
-                )
-                if resp is None:
-                    continue
-                if resp.status in (200, 201):
-                    success_count += 1
-                    findings.append({
-                        "type": "Default Credentials Accepted",
-                        "severity": "Critical",
-                        "details": (
-                            f"Login succeeded with username='{username}', "
-                            f"password='{password}'."
-                        ),
-                        "credentials": {"username": username, "password": password},
-                    })
-                    # Check for JWT in response
-                    jwt_pat = re.search(
-                        r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*',
-                        body,
-                    )
-                    if jwt_pat:
-                        analyser = JWTAnalyser()
-                        jwt_findings = analyser.analyse(jwt_pat.group(0))
-                        for jf in jwt_findings:
-                            findings.append({
-                                "type": f"JWT Issue: {jf.issue}",
-                                "severity": jf.severity,
-                                "details": jf.details,
-                            })
-
-            # Brute-force rate-limit check
-            if success_count == 0 and len(default_creds) >= 5:
+        success_count = 0
+        for username, password in default_creds:
+            headers = {
+                **self._evasion.build_headers(),
+                "Content-Type": "application/json",
+            }
+            resp, body = await self._evasion.resilient_request(
+                session, "POST", obs.url,
+                json={"username": username, "password": password},
+                headers=headers,
+            )
+            if resp is None:
+                continue
+            if resp.status in (200, 201):
+                success_count += 1
                 findings.append({
-                    "type": "Auth Endpoint Rate-Limit Check",
-                    "severity": "Low",
+                    "type": "Default Credentials Accepted",
+                    "severity": "Critical",
                     "details": (
-                        f"Sent {len(default_creds)} login attempts without triggering "
-                        "a lockout or 429 response. "
-                        "Verify whether rate-limiting / account lockout is enforced."
+                        f"Login succeeded with username='{username}', "
+                        f"password='{password}'."
                     ),
+                    "credentials": {"username": username, "password": password},
                 })
+                # Check for JWT in response
+                jwt_pat = re.search(
+                    r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*',
+                    body,
+                )
+                if jwt_pat:
+                    analyser = JWTAnalyser()
+                    jwt_findings = analyser.analyse(jwt_pat.group(0))
+                    for jf in jwt_findings:
+                        findings.append({
+                            "type": f"JWT Issue: {jf.issue}",
+                            "severity": jf.severity,
+                            "details": jf.details,
+                        })
+
+        # Brute-force rate-limit check
+        if success_count == 0 and len(default_creds) >= 5:
+            findings.append({
+                "type": "Auth Endpoint Rate-Limit Check",
+                "severity": "Low",
+                "details": (
+                    f"Sent {len(default_creds)} login attempts without triggering "
+                    "a lockout or 429 response. "
+                    "Verify whether rate-limiting / account lockout is enforced."
+                ),
+            })
 
         return findings
 
@@ -651,28 +686,26 @@ class AutonomousAgent:
         if not base:
             return findings
 
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(
-            connector=connector, timeout=self._timeout
-        ) as session:
-            for path in common_admin_paths:
-                probe_url = base.group(1) + path
-                if probe_url in self._visited:
-                    continue
-                headers = self._evasion.build_headers()
-                resp, _ = await self._evasion.resilient_request(
-                    session, "GET", probe_url, headers=headers
-                )
-                if resp and resp.status == 200:
-                    findings.append({
-                        "type": "Exposed Admin Endpoint",
-                        "severity": "High",
-                        "details": (
-                            f"Admin-like path '{probe_url}' returned HTTP 200 "
-                            "without authentication."
-                        ),
-                        "probe_url": probe_url,
-                    })
+        session = self._session
+
+        for path in common_admin_paths:
+            probe_url = base.group(1) + path
+            if probe_url in self._visited:
+                continue
+            headers = self._evasion.build_headers()
+            resp, _ = await self._evasion.resilient_request(
+                session, "GET", probe_url, headers=headers
+            )
+            if resp and resp.status == 200:
+                findings.append({
+                    "type": "Exposed Admin Endpoint",
+                    "severity": "High",
+                    "details": (
+                        f"Admin-like path '{probe_url}' returned HTTP 200 "
+                        "without authentication."
+                    ),
+                    "probe_url": probe_url,
+                })
 
         return findings
 
