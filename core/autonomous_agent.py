@@ -294,17 +294,22 @@ class AutonomousAgent:
                         depth, len(batch),
                     )
 
-                    tasks = [
-                        asyncio.create_task(
-                            self._ooda_cycle(session, url, queue)
-                        )
-                        for url in batch
-                        if url not in self._visited
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for exc in results:
-                        if isinstance(exc, Exception):
-                            logger.error("[Agent] OODA cycle error: %s", exc, exc_info=False)
+                    async def _wrap(u: str) -> None:
+                        try:
+                            await self._ooda_cycle(session, u, queue)
+                        except Exception as exc:  # pylint: disable=broad-except
+                            logger.error(
+                                "[Agent] OODA cycle error for %s: %s", u, exc, exc_info=False
+                            )
+
+                    await asyncio.gather(
+                        *[
+                            asyncio.create_task(_wrap(url))
+                            for url in batch
+                            if url not in self._visited
+                        ],
+                        return_exceptions=True,
+                    )
             finally:
                 self._session = None
 
@@ -328,6 +333,10 @@ class AutonomousAgent:
         if url in self._visited:
             return
         self._visited.add(url)
+
+        if self._session is None:
+            logger.warning("[Agent] _ooda_cycle called outside of run() context; skipping %s", url)
+            return
 
         async with self._sem:
             # ── Observe ──────────────────────────────────────────────────────
@@ -445,8 +454,21 @@ class AutonomousAgent:
     # ------------------------------------------------------------------
 
     def _record_finding(self, finding: Dict[str, Any]) -> None:
-        """Append *finding* only if an identical (type, url) pair hasn't been seen."""
-        key = f"{finding.get('type', '')}|{finding.get('url', '')}"
+        """Append *finding* only if it hasn't been seen before.
+
+        The deduplication key covers the fields most likely to distinguish
+        separate findings of the same type: ``type``, ``url``, ``probe_url``,
+        ``role``, and ``method``.  This prevents suppressing distinct IDOR
+        findings (different probe IDs) or auth findings (different creds)
+        while still avoiding exact duplicates.
+        """
+        key = "|".join([
+            str(finding.get("type", "")),
+            str(finding.get("url", "")),
+            str(finding.get("probe_url", "")),
+            str(finding.get("role", "")),
+            str(finding.get("method", "")),
+        ])
         if key not in self._finding_keys:
             self._finding_keys.add(key)
             self._findings.append(finding)
@@ -473,8 +495,6 @@ class AutonomousAgent:
         """
         findings: List[Dict[str, Any]] = []
         session = self._session
-        if session is None:
-            return findings
 
         # Probe 1: Introspection
         introspection_query = {
@@ -523,8 +543,6 @@ class AutonomousAgent:
         """
         findings: List[Dict[str, Any]] = []
         session = self._session
-        if session is None:
-            return findings
 
         # IDOR path probe: replace trailing numeric segment with adjacent IDs
         idor_match = re.search(r'/(\d+)(?:/[^/]*)?$', obs.url)
@@ -582,8 +600,6 @@ class AutonomousAgent:
 
         findings: List[Dict[str, Any]] = []
         session = self._session
-        if session is None:
-            return findings
 
         default_creds = [
             ("admin", "admin"), ("admin", "password"), ("admin", "123456"),
@@ -671,8 +687,6 @@ class AutonomousAgent:
             return findings
 
         session = self._session
-        if session is None:
-            return findings
 
         for path in common_admin_paths:
             probe_url = base.group(1) + path
